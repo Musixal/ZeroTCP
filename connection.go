@@ -122,6 +122,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 			return 0, ErrClosed
 		}
 		n := copy(b, data)
+		fmt.Println("new data: %v", data)
 		return n, nil
 
 	case <-timeout:
