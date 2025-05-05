@@ -1,0 +1,18 @@
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# toml file
+*.toml
+
+# Makefile
+MakeFile
+
+#MacOS
+.DS_Store
+.vscode
+dist/
