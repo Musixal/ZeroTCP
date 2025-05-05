@@ -26,21 +26,6 @@ func getOutboundIP(remote net.IP) (net.IP, error) {
 	return localAddr.IP, nil
 }
 
-func getSrcMAC(deviceName string) (net.HardwareAddr, error) {
-	// Get interface MAC address
-	iface, err := net.InterfaceByName(deviceName)
-	if err != nil {
-		return nil, fmt.Errorf("error getting interface: %v", err)
-	}
-
-	srcMAC := iface.HardwareAddr
-
-	if srcMAC.String() == "" {
-		srcMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	}
-	return srcMAC, nil
-}
-
 // isPrivateIP determines if an IP address is private
 func isPrivateIP(ip net.IP) bool {
 	// Check if IP is private (RFC 1918)
