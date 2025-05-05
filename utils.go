@@ -2,6 +2,7 @@ package ZeroTCP
 
 import (
 	"errors"
+	"fmt"
 	"net"
 
 	"github.com/google/gopacket/layers"
@@ -106,4 +107,33 @@ func tcpOptions() *[]layers.TCPOption {
 	}
 
 	return &options
+}
+
+// getDeviceIP returns the IPv4 address of the given network interface
+func getDeviceIP(deviceName string) (net.IP, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Name == deviceName {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				return nil, err
+			}
+
+			for _, addr := range addrs {
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip := v.IP.To4()
+					if ip != nil {
+						return ip, nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no IPv4 address found for device %s", deviceName)
 }
