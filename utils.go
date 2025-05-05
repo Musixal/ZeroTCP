@@ -2,7 +2,6 @@ package ZeroTCP
 
 import (
 	"errors"
-	"fmt"
 	"net"
 
 	"github.com/google/gopacket/layers"
@@ -79,19 +78,6 @@ func GetLocalInterfaces() ([]net.IP, error) {
 		return nil, errors.New("no IPv4 addresses found")
 	}
 	return ips, nil
-}
-
-func processTCP(tcp *layers.TCP) {
-	fmt.Printf("TCP Flags:\n")
-	fmt.Printf("  FIN: %t\n", tcp.FIN)
-	fmt.Printf("  SYN: %t\n", tcp.SYN)
-	fmt.Printf("  RST: %t\n", tcp.RST)
-	fmt.Printf("  PSH: %t\n", tcp.PSH)
-	fmt.Printf("  ACK: %t\n", tcp.ACK)
-	fmt.Printf("  URG: %t\n", tcp.URG)
-	fmt.Printf("  ECE: %t\n", tcp.ECE)
-	fmt.Printf("  CWR: %t\n", tcp.CWR)
-	fmt.Printf("  NS:  %t\n", tcp.NS) // Reserved flag (RFC 3540)
 }
 
 func tcpOptions() *[]layers.TCPOption {
