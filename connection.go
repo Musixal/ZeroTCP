@@ -1,6 +1,7 @@
 package ZeroTCP
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -37,6 +38,8 @@ type Connection struct {
 	ipHeader      *layers.IPv4
 	readDeadline  time.Time
 	deadlineMutex sync.Mutex
+	readBuf       bytes.Buffer // internal buffer like TCP
+	bufMutex      sync.Mutex   // guards readBuf
 }
 
 // Errors
@@ -81,9 +84,8 @@ func newConnection(id FlowID, socket *pcap.Handle, checksum bool) *Connection {
 	}
 }
 
-// Read reads data from the connection with timeout support
 func (c *Connection) Read(b []byte) (int, error) {
-	// Check if deadline is set and already passed
+	// Fast-path: check deadline
 	c.deadlineMutex.Lock()
 	deadline := c.readDeadline
 	hasDeadline := !deadline.IsZero()
@@ -91,43 +93,51 @@ func (c *Connection) Read(b []byte) (int, error) {
 
 	if hasDeadline && time.Now().After(deadline) {
 		c.Close()
-		return 0, ErrTimeout // You'll need to define this error
+		return 0, ErrTimeout
 	}
 
-	// For deadline handling
 	var timer *time.Timer
 	var timeout <-chan time.Time
-
 	if hasDeadline {
-		// Calculate how much time until deadline
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			c.Close()
 			return 0, ErrTimeout
 		}
 		timer = time.NewTimer(remaining)
 		timeout = timer.C
+		defer timer.Stop()
 	}
 
-	select {
-	case <-c.closed:
-		if timer != nil {
-			timer.Stop()
+	// Loop until we can satisfy the read
+	for {
+		c.bufMutex.Lock()
+		if c.readBuf.Len() > 0 {
+			n, _ := c.readBuf.Read(b)
+			c.bufMutex.Unlock()
+			return n, nil
 		}
-		return 0, ErrClosed
-	case data, ok := <-c.in:
-		if timer != nil {
-			timer.Stop()
-		}
-		if !ok {
-			return 0, ErrClosed
-		}
-		n := copy(b, data)
-		fmt.Printf("new data: %v\n", data)
-		return n, nil
+		c.bufMutex.Unlock()
 
-	case <-timeout:
-		c.Close()
-		return 0, ErrTimeout
+		select {
+		case <-c.closed:
+			return 0, ErrClosed
+
+		case data, ok := <-c.in:
+			if !ok {
+				return 0, ErrClosed
+			}
+			// Buffer the data
+			c.bufMutex.Lock()
+			c.readBuf.Write(data)
+			n, _ := c.readBuf.Read(b)
+			c.bufMutex.Unlock()
+			return n, nil
+
+		case <-timeout:
+			c.Close()
+			return 0, ErrTimeout
+		}
 	}
 }
 
