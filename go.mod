@@ -1,6 +1,6 @@
 module github.com/Musixal/ZeroTCP
 
-go 1.24.2
+go 1.23.8
 
 require github.com/google/gopacket v1.1.19
 
