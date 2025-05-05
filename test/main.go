@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/musixal/ZeroTCP"
+	"github.com/Musixal/ZeroTCP"
 )
 
 func main() {

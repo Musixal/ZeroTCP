@@ -1,4 +1,4 @@
-module github.com/musixal/ZeroTCP
+module github.com/Musixal/ZeroTCP
 
 go 1.24.2
 
