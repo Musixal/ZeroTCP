@@ -1,7 +1,6 @@
 package ZeroTCP
 
 import (
-	"errors"
 	"fmt"
 	"net"
 )
@@ -14,11 +13,6 @@ const (
 	TCP_PSH = 1 << 3
 	TCP_ACK = 1 << 4
 	TCP_URG = 1 << 5
-)
-
-// Errors
-var (
-	ErrClosed = errors.New("connection closed")
 )
 
 // FlowID uniquely identifies a TCP connection

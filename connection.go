@@ -1,6 +1,7 @@
 package ZeroTCP
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -38,7 +39,11 @@ type Connection struct {
 	deadlineMutex sync.Mutex
 }
 
-var ErrTimeout = fmt.Errorf("i/o timeout")
+// Errors
+var (
+	ErrClosed  = errors.New("connection closed")
+	ErrTimeout = fmt.Errorf("i/o timeout")
+)
 
 var packetPool = &sync.Pool{
 	New: func() interface{} {
@@ -85,6 +90,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 	c.deadlineMutex.Unlock()
 
 	if hasDeadline && time.Now().After(deadline) {
+		c.Close()
 		return 0, ErrTimeout // You'll need to define this error
 	}
 
@@ -94,7 +100,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 
 	if hasDeadline {
 		// Calculate how much time until deadline
-		remaining :=  time.Until(deadline)
+		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return 0, ErrTimeout
 		}
@@ -117,7 +123,9 @@ func (c *Connection) Read(b []byte) (int, error) {
 		}
 		n := copy(b, data)
 		return n, nil
+
 	case <-timeout:
+		c.Close()
 		return 0, ErrTimeout
 	}
 }
