@@ -18,23 +18,27 @@ const (
 
 // Connection represents a TCP connection
 type Connection struct {
-	id        FlowID
-	in        chan []byte
-	out       chan []byte
-	handshake chan gopacket.Packet
-	closed    chan struct{}
-	socket    *pcap.Handle
-	srcIP     net.IP
-	dstIP     net.IP
-	srcPort   layers.TCPPort
-	dstPort   layers.TCPPort
-	seqNum    uint32
-	ackNum    uint32
-	mu        sync.Mutex
-	lastSeen  time.Time
-	checksum  bool
-	ipHeader  *layers.IPv4
+	id            FlowID
+	in            chan []byte
+	out           chan []byte
+	handshake     chan gopacket.Packet
+	closed        chan struct{}
+	socket        *pcap.Handle
+	srcIP         net.IP
+	dstIP         net.IP
+	srcPort       layers.TCPPort
+	dstPort       layers.TCPPort
+	seqNum        uint32
+	ackNum        uint32
+	mu            sync.Mutex
+	lastSeen      time.Time
+	checksum      bool
+	ipHeader      *layers.IPv4
+	readDeadline  time.Time
+	deadlineMutex sync.Mutex
 }
+
+var ErrTimeout = fmt.Errorf("i/o timeout")
 
 var packetPool = &sync.Pool{
 	New: func() interface{} {
@@ -72,17 +76,49 @@ func newConnection(id FlowID, socket *pcap.Handle, checksum bool) *Connection {
 	}
 }
 
-// Read reads data from the connection
+// Read reads data from the connection with timeout support
 func (c *Connection) Read(b []byte) (int, error) {
+	// Check if deadline is set and already passed
+	c.deadlineMutex.Lock()
+	deadline := c.readDeadline
+	hasDeadline := !deadline.IsZero()
+	c.deadlineMutex.Unlock()
+
+	if hasDeadline && time.Now().After(deadline) {
+		return 0, ErrTimeout // You'll need to define this error
+	}
+
+	// For deadline handling
+	var timer *time.Timer
+	var timeout <-chan time.Time
+
+	if hasDeadline {
+		// Calculate how much time until deadline
+		remaining :=  time.Until(deadline)
+		if remaining <= 0 {
+			return 0, ErrTimeout
+		}
+		timer = time.NewTimer(remaining)
+		timeout = timer.C
+	}
+
 	select {
 	case <-c.closed:
+		if timer != nil {
+			timer.Stop()
+		}
 		return 0, ErrClosed
 	case data, ok := <-c.in:
+		if timer != nil {
+			timer.Stop()
+		}
 		if !ok {
 			return 0, ErrClosed
 		}
 		n := copy(b, data)
 		return n, nil
+	case <-timeout:
+		return 0, ErrTimeout
 	}
 }
 
@@ -171,7 +207,9 @@ func (c *Connection) RemoteAddr() net.Addr {
 
 // SetDeadline sets read and write deadlines
 func (c *Connection) SetDeadline(t time.Time) error {
-	// Not implemented
+	c.deadlineMutex.Lock()
+	defer c.deadlineMutex.Unlock()
+	c.readDeadline = t
 	return nil
 }
 
