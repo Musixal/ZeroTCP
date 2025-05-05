@@ -81,14 +81,6 @@ func GetLocalInterfaces() ([]net.IP, error) {
 	return ips, nil
 }
 
-func getInterfaceMAC(deviceName string) (net.HardwareAddr, error) {
-	iface, err := net.InterfaceByName(deviceName)
-	if err != nil {
-		return nil, fmt.Errorf("error getting interface %s: %v", deviceName, err)
-	}
-	return iface.HardwareAddr, nil
-}
-
 func processTCP(tcp *layers.TCP) {
 	fmt.Printf("TCP Flags:\n")
 	fmt.Printf("  FIN: %t\n", tcp.FIN)
