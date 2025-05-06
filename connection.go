@@ -15,37 +15,45 @@ import (
 
 // Constants for TCP/IP packet configuration
 const (
-	DefaultMSS = 1460 // Maximum Segment Size for TCP over Ethernet
+	DefaultMSS = 1360 // Maximum Segment Size for TCP over Ethernet
 )
 
 // Connection represents a TCP connection
 type Connection struct {
-	id            FlowID
-	in            chan []byte
-	out           chan []byte
-	handshake     chan gopacket.Packet
-	closed        chan struct{}
-	socket        *pcap.Handle
-	srcIP         net.IP
-	dstIP         net.IP
-	srcPort       layers.TCPPort
-	dstPort       layers.TCPPort
-	seqNum        uint32
-	ackNum        uint32
-	mu            sync.Mutex
-	lastSeen      time.Time
-	checksum      bool
-	ipHeader      *layers.IPv4
+	id FlowID
+
+	in        chan []byte
+	out       chan []byte
+	handshake chan gopacket.Packet
+	closed    chan struct{}
+
+	socket *pcap.Handle
+
+	srcIP    net.IP
+	dstIP    net.IP
+	srcPort  layers.TCPPort
+	dstPort  layers.TCPPort
+	ipHeader *layers.IPv4
+
+	seqNum uint32
+	ackNum uint32
+
+	mu       sync.Mutex   // for write
+	readBuf  bytes.Buffer // internal buffer like TCP
+	bufMutex sync.Mutex   // guards readBuf
+
+	lastSeen time.Time
+	checksum bool
+
 	readDeadline  time.Time
 	deadlineMutex sync.Mutex
-	readBuf       bytes.Buffer // internal buffer like TCP
-	bufMutex      sync.Mutex   // guards readBuf
 }
 
 // Errors
 var (
 	ErrClosed  = errors.New("connection closed")
 	ErrTimeout = fmt.Errorf("i/o timeout")
+	ErrNoData  = fmt.Errorf("no data to write")
 )
 
 var packetPool = &sync.Pool{
@@ -150,7 +158,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 		defer c.mu.Unlock()
 
 		if len(b) == 0 {
-			return 0, nil // No data to write
+			return 0, ErrNoData // No data to write
 		}
 
 		for offset := 0; offset < len(b); offset += DefaultMSS {
