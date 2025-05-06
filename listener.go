@@ -115,6 +115,7 @@ func (l *Listener) listenLoop() {
 					// Update sequence number to acknowledge received data
 					conn.ackNum = tcp.Seq + uint32(len(tcp.Payload))
 					conn.lastSeen = time.Now()
+					fmt.Printf("delivered %d bytes to flowid %s\n", len(tcp.Payload), &id)
 				default:
 					fmt.Printf("payload channel for conn %s is full, discarding \n", conn.RemoteAddr())
 				}
@@ -254,6 +255,7 @@ func (l *Listener) RegisterConnection(id FlowID, conn *Connection) {
 }
 
 func (l *Listener) UnregisterConnection(id FlowID) {
+	fmt.Println("unregister connection with flowid", id.String())
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.connections, id)
