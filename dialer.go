@@ -1,53 +1,120 @@
 package ZeroTCP
 
 import (
+	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"golang.org/x/net/bpf"
 )
 
 type Dialer struct {
-	handle      *pcap.Handle
-	deviceName  string
-	connections map[FlowID]*Connection
-	mu          *sync.RWMutex
-	closed      chan struct{}
-	checksum    bool
-	port        int
+	addr       *net.TCPAddr
+	handle     *afpacket.TPacket
+	deviceName string
+	conn       *Connection
+	closed     chan struct{}
 }
 
-func NewDialer(deviceName string, remoteIP string, port int, checksum bool) (*Dialer, error) {
-	// Open pcap handle
-	handle, err := pcap.OpenLive(deviceName, 65536, true, pcap.BlockForever)
+func Dial(deviceName string, addr *net.TCPAddr) (*net.Conn, error) {
+	// Open AF_PACKET socket with ring buffer
+	handle, err := afpacket.NewTPacket(
+		afpacket.OptInterface(deviceName),
+		afpacket.OptFrameSize(65536),
+		afpacket.OptBlockSize(1<<20), // 1MB block
+		afpacket.OptNumBlocks(64),
+		afpacket.OptPollTimeout(time.Millisecond*100),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("error opening pcap handle: %v", err)
+		return nil, fmt.Errorf("error opening afpacket handle: %v", err)
 	}
 
-	// Set BPF filter to only capture packets from remoteIP
-	filter := fmt.Sprintf("ip and src host %s", remoteIP)
+	// filter := fmt.Sprintf("tcp and src host %s and src port %d", addr.IP.String(), addr.Port)
+	// Convert 4‐byte IPv4 into a big‐endian uint32:
+	ip4 := addr.IP.To4()
+	if ip4 == nil {
+		log.Fatal("not an IPv4 address")
+	}
+	ipVal := binary.BigEndian.Uint32(ip4)
+	portVal := uint32(addr.Port)
 
-	if err := handle.SetBPFFilter(filter); err != nil {
-		handle.Close()
-		return nil, fmt.Errorf("error setting BPF filter: %v", err)
+	filter := []bpf.Instruction{
+		// 0) Check Ethernet type == 0x0800 (IPv4)
+		bpf.LoadAbsolute{Off: 12, Size: 2},
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       0x0800,
+			SkipTrue:  0,
+			SkipFalse: 7, // if not IPv4 → skip to drop
+		},
+
+		// 1) Check IP protocol == TCP (6)
+		//    IP proto is at byte offset 14+9 = 23
+		bpf.LoadAbsolute{Off: 23, Size: 1},
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       6,
+			SkipTrue:  0,
+			SkipFalse: 5, // if not TCP → skip to drop
+		},
+
+		// 2) Check IP source address == ipVal
+		//    Src IP starts at 14+12 = 26, length=4
+		bpf.LoadAbsolute{Off: 26, Size: 4},
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       ipVal,
+			SkipTrue:  0,
+			SkipFalse: 3, // if src IP mismatch → skip to drop
+		},
+
+		// 3) Check TCP source port == portVal
+		//    With a 20‐byte IP header, TCP header starts at offset 14+20 = 34
+		//    Src port is the first 2 bytes
+		bpf.LoadAbsolute{Off: 34, Size: 2},
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       portVal,
+			SkipTrue:  0,
+			SkipFalse: 1, // if port mismatch → skip to drop
+		},
+
+		// 4) All tests passed → accept
+		bpf.RetConstant{Val: 0xFFFFFFFF},
+
+		// 5) One of the tests failed → drop
+		bpf.RetConstant{Val: 0},
+	}
+
+	// To apply:
+	insns, err := bpf.Assemble(filter)
+	if err != nil {
+		log.Fatal("BPF assembly failed:", err)
+	}
+	if err := handle.SetBPF(insns); err != nil {
+		log.Fatal("apply BPF failed:", err)
 	}
 
 	d := &Dialer{
-		handle:      handle,
-		deviceName:  deviceName,
-		connections: make(map[FlowID]*Connection),
-		mu:          &sync.RWMutex{},
-		closed:      make(chan struct{}),
-		checksum:    checksum,
-		port:        port,
+		addr:       addr,
+		handle:     handle,
+		deviceName: deviceName,
+		closed:     make(chan struct{}),
 	}
 
 	//Block incoming traffic with a source port of x
-	args := []string{"-A", "INPUT", "-p", "tcp", "--sport", fmt.Sprintf("%d", port), "-j", "DROP"}
+	args := []string{
+		"-A", "INPUT",
+		"-p", "tcp",
+		"--src", addr.IP.String(),
+		"--sport", fmt.Sprintf("%d", addr.Port),
+		"-j", "DROP",
+	}
 
 	err = runIptablesWithSudo(args)
 	if err != nil {
@@ -57,15 +124,16 @@ func NewDialer(deviceName string, remoteIP string, port int, checksum bool) (*Di
 		fmt.Println("Rule applied successfully!")
 	}
 
-	// Start handler in a goroutine
-	go d.handlerLoop()
-	go d.CleanStaleConnections()
-
-	return d, nil
+	conn, err := d.dial(addr)
+	if err != nil {
+		handle.Close()
+		return nil, fmt.Errorf("error dial: %v", err)
+	}
+	return &conn, err
 }
 
 func (d *Dialer) handlerLoop() {
-	packetSource := gopacket.NewPacketSource(d.handle, d.handle.LinkType())
+	packetSource := gopacket.NewPacketSource(d.handle, layers.LinkTypeEthernet)
 
 	for {
 		select {
@@ -84,30 +152,15 @@ func (d *Dialer) handlerLoop() {
 			if ipLayer == nil || tcpLayer == nil {
 				continue
 			}
-
-			ip := ipLayer.(*layers.IPv4)
 			tcp := tcpLayer.(*layers.TCP)
 
-			// Create FlowID and Reverse it
-			id := *NewFlowID(ip.SrcIP, ip.DstIP, uint16(tcp.SrcPort), uint16(tcp.DstPort)).Reverse()
-
-			// Check the FlowID in the existing connections
-			d.mu.RLock()
-			conn, exists := d.connections[id]
-			d.mu.RUnlock()
-
-			if !exists {
-				continue
-			}
-
-			if conn.IsClosed() {
-				d.UnregisterConnection(id)
-				continue
+			if d.conn.IsClosed() {
+				return
 			}
 
 			if tcp.SYN && tcp.ACK { // Handshake signal
 				select {
-				case conn.handshake <- packet:
+				case d.conn.handshake <- packet:
 
 				default:
 					fmt.Println("handshake channel is full already")
@@ -117,8 +170,8 @@ func (d *Dialer) handlerLoop() {
 
 			if tcp.ACK && tcp.PSH { // Payload signal
 				select {
-				case conn.in <- tcp.Payload:
-					conn.lastSeen = time.Now()
+				case d.conn.in <- tcp.Payload:
+					d.conn.lastSeen = time.Now()
 
 				default:
 					fmt.Println("payload channel is full already")
@@ -127,32 +180,20 @@ func (d *Dialer) handlerLoop() {
 			}
 
 			if tcp.ACK && tcp.RST { // Connection Terminated
-				fmt.Println("RST packet recieved, unregister connection: ", id)
-				d.UnregisterConnection(id)
-				conn.Close()
-				continue
+				fmt.Println("RST packet recieved, unregister connection: ", d.conn.id)
+				d.conn.Close()
+				return
 			}
 		}
 	}
 }
 
 // Dial establishes a TCP connection
-func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
-	// Parse remote address
-	addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid address: %v", err)
-	}
-
-	remoteIP := addr.IP.To4()
-	if remoteIP == nil {
-		return nil, fmt.Errorf("non-IPv4 address not supported: %v", addr.IP)
-	}
-
-	remotePort := uint16(addr.Port)
+func (d *Dialer) dial(remoteAddr *net.TCPAddr) (net.Conn, error) {
+	remotePort := remoteAddr.AddrPort().Port()
 
 	// Get local IP address for the interface
-	localIP, err := getOutboundIP(remoteIP)
+	localIP, err := getOutboundIP(remoteAddr.IP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine local address: %v", err)
 	}
@@ -169,7 +210,7 @@ func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
 		TTL:      64,
 		Protocol: layers.IPProtocolTCP,
 		SrcIP:    localIP,
-		DstIP:    remoteIP,
+		DstIP:    remoteAddr.IP,
 		IHL:      5,
 		Length:   20, // Will be adjusted by SerializeLayers
 	}
@@ -192,13 +233,11 @@ func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
 	defer packetPool.Put(buf)
 
 	// Set network layer for checksum calculation if needed
-	if d.checksum {
-		tcp.SetNetworkLayerForChecksum(&ip)
-	}
+	tcp.SetNetworkLayerForChecksum(&ip)
 
 	opts := gopacket.SerializeOptions{
 		FixLengths:       true,
-		ComputeChecksums: d.checksum,
+		ComputeChecksums: true,
 	}
 
 	// err = gopacket.SerializeLayers(buf, opts, &ip, &tcp)
@@ -208,16 +247,16 @@ func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
 	}
 
 	// Send the SYN packet
-	if err := SendIPv4RawPacket(remoteIP, buf.Bytes()); err != nil {
+	if err := SendIPv4RawPacket(remoteAddr.IP, buf.Bytes()); err != nil {
 		return nil, fmt.Errorf("error sending SYN: %v", err)
 	}
 
 	// Create the flow ID
-	id := NewFlowID(localIP, remoteIP, localPort, remotePort)
+	id := NewFlowID(localIP, remoteAddr.IP, localPort, remotePort)
 
 	// Creating and registering new connection
-	conn := newConnection(*id, d.handle, d.checksum)
-	d.RegisterConnection(*id, conn)
+	conn := newConnection(*id, d.handle)
+	d.conn = conn
 
 	// Step 2: Wait for SYN-ACK
 	var receivedSeq uint32
@@ -225,16 +264,20 @@ func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
 
 	timeout := time.After(5 * time.Second)
 
+	// Start handler in a goroutine
+	go d.handlerLoop()
+	go d.CleanStaleConnections()
+
 	select {
 	case <-timeout:
-		d.UnregisterConnection(*id)
+		//d.UnregisterConnection(*id)
 		return nil, fmt.Errorf("timeout waiting for SYN-ACK")
-	case packet := <-conn.handshake:
+	case packet := <-d.conn.handshake:
 		// Parse TCP layer
 		tcpLayer := packet.Layer(layers.LayerTypeTCP)
 
 		if tcpLayer == nil {
-			d.UnregisterConnection(*id)
+			//d.UnregisterConnection(*id)
 			return nil, fmt.Errorf("tcp layer is nil")
 		}
 		tcpPacket, _ := tcpLayer.(*layers.TCP)
@@ -261,36 +304,22 @@ func (d *Dialer) Dial(remoteAddr string) (net.Conn, error) {
 	conn.seqNum = receivedAck     // Update sequence number
 	conn.ackNum = receivedSeq + 1 // Update acknowledgment number
 
-	if d.checksum {
-		tcp.SetNetworkLayerForChecksum(&ip)
-	}
+	tcp.SetNetworkLayerForChecksum(&ip)
 
 	buf = gopacket.NewSerializeBuffer()
 	err = gopacket.SerializeLayers(buf, opts, &ip, &tcp)
 	if err != nil {
-		d.UnregisterConnection(*id)
+		//	d.UnregisterConnection(*id)
 		return nil, fmt.Errorf("error serializing ACK packet: %v", err)
 	}
 
 	// Send the ACK packet
-	if err := SendIPv4RawPacket(conn.dstIP, buf.Bytes()); err != nil {
-		d.UnregisterConnection(*id)
+	if err := SendIPv4RawPacket(conn.id.DstIP[:], buf.Bytes()); err != nil {
+		//d.UnregisterConnection(*id)
 		return nil, fmt.Errorf("error sending ACK: %v", err)
 	}
 
 	return conn, nil
-}
-
-func (d *Dialer) RegisterConnection(id FlowID, conn *Connection) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.connections[id] = conn
-}
-
-func (d *Dialer) UnregisterConnection(id FlowID) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.connections, id)
 }
 
 // CleanStaleConnections removes connections with `lastSeen` older than 1 minute
@@ -303,18 +332,18 @@ func (d *Dialer) CleanStaleConnections() {
 		case <-d.closed:
 			return
 		case <-ticker.C:
-			d.mu.Lock()
-			defer d.mu.Unlock()
+			//d.mu.Lock()
+			//defer d.mu.Unlock()
 
 			threshold := time.Now().Add(-1 * time.Minute) // 1-minute cutoff
 
-			for id, conn := range d.connections {
-				if conn.lastSeen.Before(threshold) {
-					fmt.Printf("Removing connection %s due to inactivity", conn.RemoteAddr())
-					delete(d.connections, id) // Remove it from the connections map
-					conn.Close()              // Close the connection safely
-				}
+			//for id, conn := range d.connections {
+			if d.conn.lastSeen.Before(threshold) {
+				//	fmt.Printf("Removing connection %s due to inactivity", d.conn.RemoteAddr())
+				//delete(d.connections, id) // Remove it from the connections map
+				d.conn.Close() // Close the connection safely
 			}
+			//}
 		}
 	}
 }
@@ -322,7 +351,13 @@ func (d *Dialer) CleanStaleConnections() {
 // Close closes the pcap handle
 func (d *Dialer) Close() error {
 	// Remove iptable Rule
-	args := []string{"-D", "INPUT", "-p", "tcp", "--sport", fmt.Sprintf("%d", d.port), "-j", "DROP"}
+	args := []string{
+		"-D", "INPUT",
+		"-p", "tcp",
+		"--src", d.addr.IP.String(),
+		"--sport", fmt.Sprintf("%d", d.addr.Port),
+		"-j", "DROP",
+	}
 
 	err := runIptablesWithSudo(args)
 	if err != nil {
@@ -333,11 +368,7 @@ func (d *Dialer) Close() error {
 
 	close(d.closed)
 
-	// close all connections
-	for _, conn := range d.connections {
-		conn.Close()
-	}
-
+	d.conn.Close()
 	d.handle.Close()
 	fmt.Println("pcap closed")
 	return nil

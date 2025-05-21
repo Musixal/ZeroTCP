@@ -7,43 +7,85 @@ import (
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"golang.org/x/net/bpf"
 )
 
 // Listener listens for incoming TCP connections
 type Listener struct {
-	handle      *pcap.Handle
+	handle      *afpacket.TPacket
 	deviceName  string
 	port        uint16
 	acceptChan  chan *Connection
 	closed      chan struct{}
-	checksum    bool
 	mu          *sync.RWMutex // For FlowIDs
 	connections map[FlowID]*Connection
 }
 
 // NewListener creates a new TCP listener
-func NewListener(deviceName string, port uint16, checksum bool) (*Listener, error) {
-	handle, err := pcap.OpenLive(deviceName, 65536, true, pcap.BlockForever)
+func Listen(deviceName string, port uint16) (*Listener, error) {
+	// Open AF_PACKET socket with ring buffer
+	handle, err := afpacket.NewTPacket(
+		afpacket.OptInterface(deviceName),
+		afpacket.OptFrameSize(65536),
+		afpacket.OptBlockSize(1<<20), // 1MB block
+		afpacket.OptNumBlocks(64),
+		afpacket.OptPollTimeout(time.Millisecond*100),
+		afpacket.OptAddVLANHeader(false),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("error opening pcap handle: %v", err)
+		return nil, fmt.Errorf("error opening afpacket handle: %v", err)
 	}
 
-	filter := fmt.Sprintf("tcp dst port %d", port)
-	if err := handle.SetBPFFilter(filter); err != nil {
-		handle.Close()
-		return nil, fmt.Errorf("error setting BPF filter: %v", err)
+	filter := []bpf.Instruction{
+		//  0) load Ethernet[23] → the IP Protocol
+		bpf.LoadAbsolute{Off: 23, Size: 1},
+
+		//  1) if proto == 6 (TCP) → fall through; else → jump to instr 5 (drop)
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       6,
+			SkipTrue:  0,
+			SkipFalse: 3, // 1+3 = 4, then next is 5
+		},
+
+		//  2) load TCP dest-port @ Ethernet(14)+IP(20)+Offset(2) = 36
+		bpf.LoadAbsolute{Off: 36, Size: 2},
+
+		//  3) if port == P → fall through; else → jump to instr 5 (drop)
+		bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       uint32(port),
+			SkipTrue:  0,
+			SkipFalse: 1, // 3+1 = 4, then next is 5
+		},
+
+		//  4) accept
+		bpf.RetConstant{Val: 0xFFFFFFFF},
+
+		//  5) drop
+		bpf.RetConstant{Val: 0},
+	}
+
+	// Compile the filter into raw format
+	rawInsns, err := bpf.Assemble(filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to assemble BPF: %v", err)
+	}
+
+	err = handle.SetBPF(rawInsns)
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply BPF: %v", err)
 	}
 
 	l := &Listener{
 		handle:      handle,
 		deviceName:  deviceName,
 		port:        port,
-		acceptChan:  make(chan *Connection, 10),
+		acceptChan:  make(chan *Connection, 10), // Buffer up to 10 conn for accepting
 		connections: make(map[FlowID]*Connection),
 		closed:      make(chan struct{}),
-		checksum:    checksum,
 		mu:          &sync.RWMutex{},
 	}
 
@@ -63,20 +105,23 @@ func NewListener(deviceName string, port uint16, checksum bool) (*Listener, erro
 	return l, nil
 }
 
-// listenLoop handles incoming connections
 func (l *Listener) listenLoop() {
-	packetSource := gopacket.NewPacketSource(l.handle, l.handle.LinkType())
+	packetSource := gopacket.NewPacketSource(l.handle, layers.LayerTypeEthernet)
 
 	for {
 		select {
 		case <-l.closed:
 			return
+
 		case packet, ok := <-packetSource.Packets():
 			if !ok {
 				return
 			}
 
-			// Parse IP and TCP layer
+			if packet == nil {
+				continue
+			}
+
 			ipLayer := packet.Layer(layers.LayerTypeIPv4)
 			tcpLayer := packet.Layer(layers.LayerTypeTCP)
 
@@ -87,15 +132,13 @@ func (l *Listener) listenLoop() {
 			ip := ipLayer.(*layers.IPv4)
 			tcp := tcpLayer.(*layers.TCP)
 
-			// Create FlowID
 			id := *NewFlowID(ip.SrcIP, ip.DstIP, uint16(tcp.SrcPort), uint16(tcp.DstPort)).Reverse()
 
-			// Check the FlowID in the existing connections
 			l.mu.RLock()
 			conn, exists := l.connections[id]
 			l.mu.RUnlock()
 
-			if !exists && tcp.SYN && !tcp.ACK { //  handle SYN packets
+			if !exists && tcp.SYN && !tcp.ACK {
 				go l.handshake(id, tcp)
 				continue
 			}
@@ -109,37 +152,36 @@ func (l *Listener) listenLoop() {
 				continue
 			}
 
-			if tcp.ACK && tcp.PSH { // Payload signal
+			if tcp.ACK && tcp.PSH {
 				select {
 				case conn.in <- tcp.Payload:
-					// Update sequence number to acknowledge received data
 					conn.ackNum = tcp.Seq + uint32(len(tcp.Payload))
 					conn.lastSeen = time.Now()
-					fmt.Printf("delivered %d bytes to flowid %s\n", len(tcp.Payload), &id)
+
 				default:
-					fmt.Printf("payload channel for conn %s is full, discarding \n", conn.RemoteAddr())
+					fmt.Printf("conn.in full for %s\n", conn.RemoteAddr())
 				}
 				continue
 			}
 
-			if tcp.ACK && tcp.RST { // Connection Terminated
-				fmt.Println("RST packet recieved, unregister connection: ", id)
-				l.UnregisterConnection(id)
+			if tcp.ACK && tcp.RST {
+				fmt.Println("RST packet received, unregistering")
+				go l.UnregisterConnection(id)
 				conn.Close()
 				continue
 			}
 
-			if tcp.ACK && !tcp.SYN { // Handshake signal
+			if tcp.ACK && !tcp.SYN && !tcp.PSH {
 				select {
 				case conn.handshake <- packet:
 				default:
-					fmt.Printf("handshake channel for conn %s is full, discarding \n", conn.RemoteAddr())
+					fmt.Printf("handshake channel full for %s\n", conn.RemoteAddr())
 				}
 				continue
 			}
-
 		}
 	}
+
 }
 
 func (l *Listener) handshake(id FlowID, tcp *layers.TCP) {
@@ -171,14 +213,12 @@ func (l *Listener) handshake(id FlowID, tcp *layers.TCP) {
 	// Modify TCP options to match standard format
 	tcp.Options = *tcpOptions()
 
-	if l.checksum {
-		tcpResp.SetNetworkLayerForChecksum(&ipv4)
-	}
+	tcpResp.SetNetworkLayerForChecksum(&ipv4)
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
 		FixLengths:       true,
-		ComputeChecksums: l.checksum,
+		ComputeChecksums: true,
 	}
 
 	err := gopacket.SerializeLayers(buf, opts, &ipv4, &tcpResp)
@@ -188,23 +228,28 @@ func (l *Listener) handshake(id FlowID, tcp *layers.TCP) {
 	}
 
 	// Register new connection
-	newConn := newConnection(id, l.handle, l.checksum)
+	newConn := newConnection(id, l.handle)
 	l.RegisterConnection(id, newConn)
 
 	if err := SendIPv4RawPacket(id.DstIP[:], buf.Bytes()); err != nil {
-		fmt.Printf("error  serialize layers2: %s", err)
+		fmt.Printf("error serialize layers2: %s", err)
 		l.UnregisterConnection(id)
 		return
 	}
 
 	// Step 2: Wait for ACK
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(3 * time.Second)
 	select {
 	case <-timeout:
 		fmt.Println("timeout waiting for ack")
+		l.UnregisterConnection(id)
 		return
 
 	case packet := <-newConn.handshake:
+		if packet == nil {
+			l.UnregisterConnection(id)
+			return
+		}
 		tcpLayer := packet.Layer(layers.LayerTypeTCP)
 		if tcpLayer == nil {
 			l.UnregisterConnection(id)
@@ -263,7 +308,7 @@ func (l *Listener) UnregisterConnection(id FlowID) {
 
 // CleanStaleConnections removes connections with `lastSeen` older than 1 minute
 func (l *Listener) CleanStaleConnections() {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -271,19 +316,19 @@ func (l *Listener) CleanStaleConnections() {
 		case <-l.closed:
 			return
 		case <-ticker.C:
-			l.mu.Lock()
-			defer l.mu.Unlock()
 
 			threshold := time.Now().Add(-1 * time.Minute) // 1-minute cutoff
 
+			l.mu.Lock()
 			for id, conn := range l.connections {
 				if conn.lastSeen.Before(threshold) {
-					fmt.Printf("Removing connection %s due to inactivity", conn.RemoteAddr())
+					//	fmt.Printf("Removing connection %s due to inactivity", conn.RemoteAddr())
 					delete(l.connections, id) // Remove it from the connections map
 					conn.Close()              // Close the connection safely
 
 				}
 			}
+			l.mu.Unlock()
 		}
 	}
 }

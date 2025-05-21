@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
+	"syscall"
 
 	"github.com/google/gopacket/layers"
 )
@@ -136,4 +138,47 @@ func getDeviceIP(deviceName string) (net.IP, error) {
 	}
 
 	return nil, fmt.Errorf("no IPv4 address found for device %s", deviceName)
+}
+
+// runIptablesWithSudo executes the iptables command with sudo
+func runIptablesWithSudo(args []string) error {
+	// Prepend "sudo" to the command
+	fullCommand := append([]string{"iptables"}, args...)
+	cmd := exec.Command("sudo", fullCommand...)
+
+	// Execute the command and capture output
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to execute iptables command: %v\noutput: %s", err, output)
+	}
+
+	fmt.Printf("Command executed successfully: %s\n", output)
+	return nil
+}
+
+func SendIPv4RawPacket(dstIP net.IP, packet []byte) error {
+	// Create raw socket
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil {
+		return fmt.Errorf("socket error: %w", err)
+	}
+	defer syscall.Close(fd)
+
+	// Tell kernel not to add its own IP header
+	err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+	if err != nil {
+		return fmt.Errorf("setsockopt IP_HDRINCL error: %w", err)
+	}
+
+	// Destination address struct
+	var addr syscall.SockaddrInet4
+	copy(addr.Addr[:], dstIP.To4())
+
+	// Send raw packet
+	err = syscall.Sendto(fd, packet, 0, &addr)
+	if err != nil {
+		return fmt.Errorf("sendto error: %w", err)
+	}
+
+	return nil
 }

@@ -13,11 +13,10 @@ import (
 
 func main() {
 	mode := flag.String("mode", "", "Mode to run in: 'listen' or 'dial'")
-	port := flag.Int("port", 8080, "Port to listen on or connect to")
-	ip := flag.String("ip", "127.0.0.1", "IP address to connect to (dial mode only)")
-	device := flag.String("device", "lo", "Network device to use (e.g., 'lo', 'eth0')")
-	checksum := flag.Bool("checksum", true, "Enable TCP checksum calculation")
-	size := flag.Int("size", 1024, "Size of data to transfer in bytes")
+	port := flag.Int("port", 7070, "Port to listen on or connect to")
+	ip := flag.String("ip", "0.0.0.0", "IP address to connect to (dial mode only)")
+	device := flag.String("device", "eth0", "Network device to use (e.g., 'lo', 'eth0')")
+	size := flag.Int("size", 200*1024*1024, "Size of data to transfer in bytes")
 	count := flag.Int("count", 1, "Number of transfers to perform (dial mode only)")
 	parallel := flag.Int("parallel", 1, "Number of parallel connections (dial mode only)")
 
@@ -31,9 +30,9 @@ func main() {
 
 	switch *mode {
 	case "listen":
-		runListener(*device, *port, *checksum)
+		runListener(*device, *port)
 	case "dial":
-		runDialer(*device, *ip, *port, *checksum, *size, *count, *parallel)
+		runDialer(*device, *ip, *port, *size, *count, *parallel)
 	default:
 		fmt.Printf("Unknown mode: %s\n", *mode)
 		flag.Usage()
@@ -41,10 +40,10 @@ func main() {
 	}
 }
 
-func runListener(device string, port int, checksum bool) {
-	fmt.Printf("Starting listener on device %s, port %d (checksum: %v)\n", device, port, checksum)
+func runListener(device string, port int) {
+	fmt.Printf("Starting listener on device %s, port %d \n", device, port)
 
-	listener, err := ZeroTCP.NewListener(device, uint16(port), checksum)
+	listener, err := ZeroTCP.Listen(device, uint16(port))
 	if err != nil {
 		log.Fatalf("Failed to create listener: %v", err)
 	}
@@ -68,7 +67,7 @@ func handleConnection(conn net.Conn) {
 	remote := conn.RemoteAddr()
 	fmt.Printf("New connection from %s\n", remote)
 
-	buf := make([]byte, 64*1024) // 64KB buffer
+	buf := make([]byte, 1400)
 	totalBytes := 0
 	start := time.Now()
 
@@ -83,34 +82,41 @@ func handleConnection(conn net.Conn) {
 		}
 		totalBytes += nt
 
-		_, err = conn.Write(buf[:nt])
-		if err != nil {
-			log.Printf("Write failed: %v", err)
-			return
-		}
+		// _, err = conn.Write(buf[:nt])
+		// if err != nil {
+		// 	log.Printf("Write failed: %v", err)
+		// 	return
+		// }
 
 	}
 }
 
-func runDialer(device, ip string, port int, checksum bool, size, count, parallel int) {
-	fmt.Printf("Starting dialer to %s:%d (checksum: %v, size: %d, count: %d, parallel: %d)\n",
-		ip, port, checksum, size, count, parallel)
+func runDialer(device, ip string, port int, size, count, parallel int) {
+	fmt.Printf("Starting dialer to %s:%d ( size: %d, count: %d, parallel: %d)\n",
+		ip, port, size, count, parallel)
 
 	results := make(chan time.Duration, count)
 	sem := make(chan struct{}, parallel)
 
-	dialer, err := ZeroTCP.NewDialer(device, ip, port, checksum)
+	addr := net.TCPAddr{
+		IP:   net.ParseIP(ip),
+		Port: port,
+	}
+
+	dialer, err := ZeroTCP.Dial(device, &addr)
 	if err != nil {
 		log.Printf("Failed to create dialer: %v", err)
 		return
 	}
-	defer dialer.Close()
+	defer (*dialer).Close()
+
+	fmt.Printf("New connection to %s:%d\n", ip, port)
 
 	for i := 0; i < count; i++ {
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem }()
-			dialAndTransfer(dialer, device, ip, port, checksum, size, results)
+			dialAndTransfer(*dialer, size, results)
 		}()
 	}
 
@@ -150,39 +156,30 @@ func runDialer(device, ip string, port int, checksum bool, size, count, parallel
 	fmt.Printf("  Max time: %v\n", max)
 	fmt.Printf("  Avg time: %v\n", avg)
 	fmt.Printf("  Requests/sec: %.2f\n", float64(count)/avg.Seconds())
-	fmt.Printf("  MB/sec: %.2f\n", float64(totalSize)/1024/1024/avg.Seconds())
+	fmt.Printf("  Mb/sec: %.2f\n", float64(totalSize)/1024/1024/avg.Seconds()*8)
 
 }
 
-func dialAndTransfer(dialer *ZeroTCP.Dialer, device, ip string, port int, checksum bool, size int, results chan<- time.Duration) {
+func dialAndTransfer(conn net.Conn, size int, results chan<- time.Duration) {
 	start := time.Now()
 
-	conn, err := dialer.Dial(fmt.Sprintf("%s:%d", ip, port))
-	if err != nil {
-		log.Printf("Dial failed: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	fmt.Printf("New connection to %s:%d\n", ip, port)
-
-	data := make([]byte, 1420)
+	data := make([]byte, 1300)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	go func() {
-		totalRead := 0
-		buf := make([]byte, size)
-		for {
-			nr, err := conn.Read(buf)
-			if err != nil {
-				log.Printf("total read is %d MB", totalRead/1024/1024)
-				return
-			}
-			totalRead += nr
-		}
-	}()
+	// go func() {
+	// 	totalRead := 0
+	// 	buf := make([]byte, 1400)
+	// 	for {
+	// 		nr, err := conn.Read(buf)
+	// 		if err != nil {
+	// 			log.Printf("total read is %d MB", totalRead/1024/1024)
+	// 			return
+	// 		}
+	// 		totalRead += nr
+	// 	}
+	// }()
 
 	written := 0
 	for written < size {

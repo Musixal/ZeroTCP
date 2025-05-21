@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 )
 
 // Constants for TCP/IP packet configuration
@@ -23,16 +23,11 @@ type Connection struct {
 	id FlowID
 
 	in        chan []byte
-	out       chan []byte
 	handshake chan gopacket.Packet
 	closed    chan struct{}
 
-	socket *pcap.Handle
+	socket *afpacket.TPacket
 
-	srcIP    net.IP
-	dstIP    net.IP
-	srcPort  layers.TCPPort
-	dstPort  layers.TCPPort
 	ipHeader *layers.IPv4
 
 	seqNum uint32
@@ -43,7 +38,6 @@ type Connection struct {
 	bufMutex sync.Mutex   // guards readBuf
 
 	lastSeen time.Time
-	checksum bool
 
 	readDeadline  time.Time
 	deadlineMutex sync.Mutex
@@ -62,7 +56,7 @@ var packetPool = &sync.Pool{
 	},
 }
 
-func newConnection(id FlowID, socket *pcap.Handle, checksum bool) *Connection {
+func newConnection(id FlowID, socket *afpacket.TPacket) *Connection {
 	ip := &layers.IPv4{
 		Version:  4,
 		IHL:      5,
@@ -74,23 +68,64 @@ func newConnection(id FlowID, socket *pcap.Handle, checksum bool) *Connection {
 	}
 	return &Connection{
 		id:        id,
-		in:        make(chan []byte, 10_000),
-		out:       make(chan []byte, 10_000),
-		handshake: make(chan gopacket.Packet, 1), // prevent blocking
+		in:        make(chan []byte, 1_000_000),
+		handshake: make(chan gopacket.Packet, 1),
 
-		closed:   make(chan struct{}),
-		socket:   socket,
-		srcIP:    net.IP(id.SrcIP[:]),
-		dstIP:    net.IP(id.DstIP[:]),
-		srcPort:  layers.TCPPort(id.SrcPort),
-		dstPort:  layers.TCPPort(id.DstPort),
+		closed: make(chan struct{}),
+		socket: socket,
+
 		seqNum:   0, // should be set after handshake
 		ackNum:   0, // should be set after handshake
 		lastSeen: time.Now(),
-		checksum: checksum,
 		ipHeader: ip,
 	}
 }
+
+// func (c *Connection) Read(b []byte) (int, error) {
+// 	// Fast-path: check deadline
+// 	c.deadlineMutex.Lock()
+// 	deadline := c.readDeadline
+// 	hasDeadline := !deadline.IsZero()
+// 	c.deadlineMutex.Unlock()
+
+// 	if hasDeadline && time.Now().After(deadline) {
+// 		c.Close()
+// 		return 0, ErrTimeout
+// 	}
+
+// 	var timer *time.Timer
+// 	var timeout <-chan time.Time
+// 	if hasDeadline {
+// 		remaining := time.Until(deadline)
+// 		if remaining <= 0 {
+// 			c.Close()
+// 			return 0, ErrTimeout
+// 		}
+// 		timer = time.NewTimer(remaining)
+// 		timeout = timer.C
+// 		defer timer.Stop()
+// 	}
+
+// 	for {
+// 		select {
+// 		case <-c.closed:
+// 			return 0, ErrClosed
+
+// 		case data, ok := <-c.in:
+// 			if !ok {
+// 				return 0, ErrClosed
+// 			}
+
+// 			n := copy(b, data)
+// 			// Optional: discard remainder or queue remainder in `c.in` again
+// 			return n, nil
+
+// 		case <-timeout:
+// 			c.Close()
+// 			return 0, ErrTimeout
+// 		}
+// 	}
+// }
 
 func (c *Connection) Read(b []byte) (int, error) {
 	// Fast-path: check deadline
@@ -162,7 +197,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 		}
 
 		for offset := 0; offset < len(b); offset += DefaultMSS {
-			end := offset + 1460
+			end := offset + DefaultMSS
 			if end > len(b) {
 				end = len(b)
 			}
@@ -179,9 +214,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 				DataOffset: 5,
 			}
 
-			if c.checksum {
-				tcp.SetNetworkLayerForChecksum(c.ipHeader)
-			}
+			tcp.SetNetworkLayerForChecksum(c.ipHeader)
 
 			// Modify TCP options to match standard format
 			tcp.Options = *tcpOptions()
@@ -192,7 +225,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 
 			opts := gopacket.SerializeOptions{
 				FixLengths:       true,
-				ComputeChecksums: c.checksum,
+				ComputeChecksums: true,
 			}
 
 			err := gopacket.SerializeLayers(buf, opts,
@@ -207,7 +240,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 			if err := SendIPv4RawPacket(c.id.DstIP[:], buf.Bytes()); err != nil {
 				return offset, fmt.Errorf("send error: %w", err)
 			}
-			//fmt.Println("write to addr: ", c.writeAddr)
+
 			// Update sequence number
 			c.seqNum += uint32(len(payload))
 		}
@@ -264,8 +297,8 @@ func (c *Connection) Close() error {
 
 		// Craft and send RST packet
 		tcp := &layers.TCP{
-			SrcPort:    c.srcPort,
-			DstPort:    c.dstPort,
+			SrcPort:    layers.TCPPort(c.id.SrcPort),
+			DstPort:    layers.TCPPort(c.id.DstPort),
 			Seq:        c.seqNum,
 			Ack:        c.ackNum,
 			RST:        true,  // Set RST flag
@@ -277,9 +310,7 @@ func (c *Connection) Close() error {
 		// Modify TCP options to match standard format
 		tcp.Options = *tcpOptions()
 
-		if c.checksum {
-			tcp.SetNetworkLayerForChecksum(c.ipHeader)
-		}
+		tcp.SetNetworkLayerForChecksum(c.ipHeader)
 
 		// Serialize RST packet
 		buf := packetPool.Get().(gopacket.SerializeBuffer)
@@ -287,7 +318,7 @@ func (c *Connection) Close() error {
 
 		opts := gopacket.SerializeOptions{
 			FixLengths:       true,
-			ComputeChecksums: c.checksum,
+			ComputeChecksums: true,
 		}
 
 		err := gopacket.SerializeLayers(buf, opts,
@@ -300,13 +331,12 @@ func (c *Connection) Close() error {
 		}
 
 		// Send the RST packet
-		if err := SendIPv4RawPacket(c.dstIP, buf.Bytes()); err != nil {
+		if err := SendIPv4RawPacket(c.id.DstIP[:], buf.Bytes()); err != nil {
 			return fmt.Errorf("failed to send RST packet: %w", err)
 		}
 
 		// Close all channels and mark as closed
 		close(c.in)
-		close(c.out)
 		close(c.handshake)
 
 		return nil
